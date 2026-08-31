@@ -1,6 +1,7 @@
 import * as db from './db.js';
 import * as calc from './calc.js';
 import * as charts from './charts.js';
+import * as drive from './drive.js';
 
 const $view = document.getElementById('app-view');
 const $nav = document.getElementById('bottom-nav');
@@ -72,6 +73,9 @@ function buildDefaultSettings() {
     overpaymentPolicyDefault: 'accumulate',
     notifyEnabled: false,
     notifyDaysBefore: 3,
+    driveEnabled: false,
+    driveClientId: '',
+    driveFolderId: '1i1JHSlhwWLesdjTT6cA3_YBXILGI-zv4',
   };
 }
 
@@ -217,11 +221,19 @@ function renderSchedule() {
 
 // ---------- Installment detail modal ----------
 
+function driveStatusBadge(status) {
+  if (status === 'uploaded') return '<span class="slip-drive-badge ok" title="อัปโหลดขึ้น Google Drive แล้ว">☁️✓</span>';
+  if (status === 'uploading') return '<span class="slip-drive-badge pending" title="กำลังอัปโหลด...">☁️⋯</span>';
+  if (status === 'failed' || status === 'pending') return '<span class="slip-drive-badge failed" title="ยังไม่ได้อัปโหลดขึ้น Google Drive">☁️!</span>';
+  return '';
+}
+
 function slipThumbHTML(inst) {
   const items = (inst.slips || []).map((s, idx) => {
     const url = trackURL(URL.createObjectURL(s.blob));
     return `<div class="slip-thumb" data-action="view-slip" data-n="${inst.installmentNumber}" data-idx="${idx}">
       <img src="${url}" alt="สลิปงวด ${inst.installmentNumber}">
+      ${driveStatusBadge(s.driveStatus)}
       <button class="slip-remove" data-action="remove-slip" data-n="${inst.installmentNumber}" data-idx="${idx}" title="ลบสลิป">✕</button>
     </div>`;
   }).join('');
@@ -354,24 +366,35 @@ function attachInstallmentModalHandlers(n) {
     render();
   });
 
-  document.getElementById('slip-file-input').addEventListener('change', async (e) => {
-    const files = Array.from(e.target.files || []);
-    if (files.length === 0) return;
-    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
-    const inst = state.installments.find((i) => i.installmentNumber === n);
-    inst.slips = inst.slips || [];
-    for (const file of files) {
-      if (!allowed.includes(file.type)) {
-        showToast('รองรับเฉพาะไฟล์ JPG, PNG, WEBP เท่านั้น');
-        continue;
-      }
-      inst.slips.push({ id: uuid(), mimeType: file.type, fileName: file.name, uploadedAt: new Date().toISOString(), blob: file });
+  document.getElementById('slip-file-input').addEventListener('change', (e) => handleSlipFiles(n, e.target.files));
+}
+
+const ALLOWED_SLIP_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+
+async function handleSlipFiles(n, fileList) {
+  const files = Array.from(fileList || []);
+  if (files.length === 0) return;
+  const inst = state.installments.find((i) => i.installmentNumber === n);
+  inst.slips = inst.slips || [];
+  const newSlips = [];
+  for (const file of files) {
+    if (!ALLOWED_SLIP_TYPES.includes(file.type)) {
+      showToast('รองรับเฉพาะไฟล์ JPG, PNG, WEBP เท่านั้น');
+      continue;
     }
-    await db.saveInstallment(inst);
-    await reloadFromDB();
-    refreshSlipGrid(n);
-    showToast('เพิ่มสลิปเรียบร้อย');
-  });
+    const slip = { id: uuid(), mimeType: file.type, fileName: file.name, uploadedAt: new Date().toISOString(), blob: file, driveStatus: null };
+    inst.slips.push(slip);
+    newSlips.push(slip);
+  }
+  await db.saveInstallment(inst);
+  await reloadFromDB();
+  refreshSlipGrid(n);
+  showToast('เพิ่มสลิปเรียบร้อย');
+
+  const s = state.settings;
+  if (s.driveEnabled && s.driveClientId && s.driveFolderId) {
+    for (const slip of newSlips) uploadSlipToDrive(n, slip.id);
+  }
 }
 
 function refreshSlipGrid(n) {
@@ -379,20 +402,67 @@ function refreshSlipGrid(n) {
   const grid = document.getElementById('slip-grid');
   if (!grid) return;
   grid.outerHTML = slipThumbHTML(inst);
-  document.getElementById('slip-file-input').addEventListener('change', async (e) => {
-    const files = Array.from(e.target.files || []);
-    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
-    const inst2 = state.installments.find((i) => i.installmentNumber === n);
-    inst2.slips = inst2.slips || [];
-    for (const file of files) {
-      if (!allowed.includes(file.type)) { showToast('รองรับเฉพาะไฟล์ JPG, PNG, WEBP เท่านั้น'); continue; }
-      inst2.slips.push({ id: uuid(), mimeType: file.type, fileName: file.name, uploadedAt: new Date().toISOString(), blob: file });
-    }
-    await db.saveInstallment(inst2);
-    await reloadFromDB();
+  document.getElementById('slip-file-input').addEventListener('change', (e) => handleSlipFiles(n, e.target.files));
+}
+
+async function uploadSlipToDrive(n, slipId) {
+  const s = state.settings;
+  const inst = state.installments.find((i) => i.installmentNumber === n);
+  const slip = inst && inst.slips.find((x) => x.id === slipId);
+  if (!slip) return;
+
+  if (!drive.isConnected()) {
+    slip.driveStatus = 'pending';
+    await db.saveInstallment(inst);
     refreshSlipGrid(n);
-    showToast('เพิ่มสลิปเรียบร้อย');
-  });
+    return;
+  }
+
+  slip.driveStatus = 'uploading';
+  refreshSlipGrid(n);
+  try {
+    const ext = slip.mimeType.split('/')[1] || 'jpg';
+    const fileName = `cx3-slip-installment${n}-${slip.uploadedAt.replace(/[:.]/g, '-')}.${ext}`;
+    const result = await drive.uploadFileToFolder({
+      clientId: s.driveClientId,
+      folderId: s.driveFolderId,
+      file: slip.blob,
+      fileName,
+    });
+    slip.driveStatus = 'uploaded';
+    slip.driveFileId = result.id;
+    slip.driveWebViewLink = result.webViewLink;
+    showToast(`อัปโหลดสลิปงวดที่ ${n} ขึ้น Google Drive แล้ว`);
+  } catch (err) {
+    slip.driveStatus = 'failed';
+    showToast('อัปโหลดขึ้น Google Drive ไม่สำเร็จ ลองใหม่ได้ในหน้าตั้งค่า');
+    console.warn('Drive upload failed', err);
+  }
+  await db.saveInstallment(inst);
+  await reloadFromDB();
+  refreshSlipGrid(n);
+}
+
+async function syncPendingSlipsToDrive() {
+  const s = state.settings;
+  if (!s.driveEnabled || !s.driveClientId || !s.driveFolderId) {
+    showToast('กรุณาเปิดใช้งานและตั้งค่า Google Drive ก่อน');
+    return;
+  }
+  if (!drive.isConnected()) {
+    showToast('กรุณาเชื่อมต่อ Google Drive ก่อน');
+    return;
+  }
+  let count = 0;
+  for (const inst of state.installments) {
+    for (const slip of inst.slips || []) {
+      if (slip.driveStatus !== 'uploaded') {
+        count++;
+        await uploadSlipToDrive(inst.installmentNumber, slip.id);
+      }
+    }
+  }
+  showToast(count > 0 ? `กำลังอัปโหลด ${count} รูปที่ค้างอยู่` : 'ไม่มีรูปที่ค้างอัปโหลด');
 }
 
 async function removeSlip(n, idx) {
@@ -412,9 +482,13 @@ function viewSlip(n, idx) {
   const url = trackURL(URL.createObjectURL(slip.blob));
   const box = document.createElement('div');
   box.className = 'lightbox';
+  const driveLink = slip.driveWebViewLink
+    ? `<a href="${slip.driveWebViewLink}" target="_blank" rel="noopener" class="lightbox-drive-link">เปิดใน Google Drive ↗</a>`
+    : '';
   box.innerHTML = `
     <button class="lightbox-close" data-action="close-lightbox">✕</button>
     <img src="${url}" alt="สลิปงวด ${n}">
+    ${driveLink}
   `;
   document.body.appendChild(box);
   box.addEventListener('click', (e) => {
@@ -643,6 +717,30 @@ function renderSettings() {
       <button class="btn btn-outline" id="btn-request-notif">ขอสิทธิ์การแจ้งเตือน (Notification)</button>
     </div>
 
+    <h3 class="section-title">สำรองสลิปขึ้น Google Drive</h3>
+    <form id="drive-settings-form" class="card">
+      <div class="field">
+        <label><input type="checkbox" name="driveEnabled" ${s.driveEnabled ? 'checked' : ''}> เปิดใช้งานอัปโหลดสลิปไป Google Drive อัตโนมัติ</label>
+      </div>
+      <div class="field">
+        <label>Google OAuth Client ID</label>
+        <input type="text" name="driveClientId" value="${s.driveClientId || ''}" placeholder="xxxxxxxx.apps.googleusercontent.com">
+        <div class="hint">สร้างได้จาก Google Cloud Console (ทำครั้งเดียว)</div>
+      </div>
+      <div class="field">
+        <label>Folder ID ปลายทางใน Google Drive</label>
+        <input type="text" name="driveFolderId" value="${s.driveFolderId || ''}">
+      </div>
+      <button type="submit" class="btn btn-outline">บันทึกการตั้งค่า Google Drive</button>
+    </form>
+    <div class="card">
+      <div id="drive-status" class="text-muted"></div>
+      <div class="btn-block-row mt-12">
+        <button class="btn btn-primary" id="btn-drive-connect">เชื่อมต่อ Google Drive</button>
+        <button class="btn btn-outline" id="btn-drive-sync">ซิงก์รูปที่ค้างอยู่</button>
+      </div>
+    </div>
+
     <h3 class="section-title">ข้อมูล / สำรองข้อมูล</h3>
     <div class="card settings-list">
       <div class="settings-item">
@@ -676,6 +774,53 @@ function renderSettings() {
     const perm = await Notification.requestPermission();
     showToast(perm === 'granted' ? 'เปิดการแจ้งเตือนสำเร็จ' : 'ไม่ได้รับสิทธิ์การแจ้งเตือน');
   });
+
+  document.getElementById('drive-settings-form').addEventListener('submit', onSaveDriveSettings);
+  document.getElementById('btn-drive-connect').addEventListener('click', onDriveConnect);
+  document.getElementById('btn-drive-sync').addEventListener('click', syncPendingSlipsToDrive);
+  updateDriveStatusUI();
+}
+
+function updateDriveStatusUI() {
+  const el = document.getElementById('drive-status');
+  if (!el) return;
+  if (drive.isConnected()) {
+    const mins = Math.ceil(drive.msUntilExpiry() / 60000);
+    el.textContent = `เชื่อมต่อ Google Drive อยู่ (จะหมดอายุใน ~${mins} นาที ต้องกดเชื่อมต่อใหม่หลังจากนั้น)`;
+    el.style.color = 'var(--color-green)';
+  } else {
+    el.textContent = 'ยังไม่ได้เชื่อมต่อ Google Drive ในรอบการใช้งานนี้';
+    el.style.color = '';
+  }
+}
+
+async function onSaveDriveSettings(e) {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const newSettings = {
+    ...state.settings,
+    driveEnabled: fd.get('driveEnabled') === 'on',
+    driveClientId: (fd.get('driveClientId') || '').trim(),
+    driveFolderId: (fd.get('driveFolderId') || '').trim(),
+  };
+  await db.saveSettings(newSettings);
+  await reloadFromDB();
+  showToast('บันทึกการตั้งค่า Google Drive แล้ว');
+}
+
+async function onDriveConnect() {
+  const clientId = (document.querySelector('#drive-settings-form [name="driveClientId"]').value || '').trim();
+  if (!clientId) {
+    showToast('กรุณากรอก Google OAuth Client ID ก่อน');
+    return;
+  }
+  try {
+    await drive.connect(clientId);
+    showToast('เชื่อมต่อ Google Drive สำเร็จ');
+  } catch (err) {
+    showToast('เชื่อมต่อไม่สำเร็จ: ' + err.message);
+  }
+  updateDriveStatusUI();
 }
 
 async function onSaveSettings(e) {

@@ -273,6 +273,14 @@ table.installment-table tr.row-clickable:active { background: var(--color-gray-b
   background: var(--color-gray-bg);
 }
 .slip-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.slip-drive-badge {
+  position: absolute; bottom: 2px; left: 2px;
+  font-size: 10px; line-height: 1;
+  background: rgba(0,0,0,0.55); color: #fff;
+  padding: 2px 4px; border-radius: 6px;
+}
+.slip-drive-badge.ok { color: #7be0ab; }
+.slip-drive-badge.failed { color: #f3b477; }
 .slip-thumb .slip-remove {
   position: absolute; top: 2px; right: 2px;
   width: 20px; height: 20px; border-radius: 50%;
@@ -295,6 +303,12 @@ table.installment-table tr.row-clickable:active { background: var(--color-gray-b
   z-index: 200; display: flex; align-items: center; justify-content: center;
 }
 .lightbox img { max-width: 96vw; max-height: 88vh; object-fit: contain; }
+.lightbox-drive-link {
+  position: absolute; bottom: max(20px, env(safe-area-inset-bottom));
+  color: #fff; background: rgba(255,255,255,0.15);
+  padding: 8px 16px; border-radius: 20px; font-size: 13px;
+  text-decoration: none;
+}
 .lightbox .lightbox-close {
   position: absolute; top: max(16px, env(safe-area-inset-top)); right: 16px;
   background: rgba(255,255,255,0.15); border: none; color: #fff;
