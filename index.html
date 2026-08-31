@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<title>CX-3 | ระบบจัดการค่างวดรถ</title>
+<meta name="theme-color" content="#16233f">
+<meta name="description" content="ระบบจัดการค่างวดรถส่วนตัว CX-3">
+
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="CX-3">
+
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div>
+    <div class="brand"><span class="brand-badge">CX3</span> CX-3</div>
+    <div class="header-sub">ระบบจัดการค่างวดรถส่วนตัว</div>
+  </div>
+  <div id="header-right"></div>
+</header>
+
+<main id="app-view" aria-live="polite"></main>
+
+<nav class="bottom-nav" id="bottom-nav">
+  <button data-view="dashboard"><span class="icon">🏠</span>หน้าหลัก</button>
+  <button data-view="schedule"><span class="icon">📅</span>ตารางผ่อน</button>
+  <button data-view="history"><span class="icon">🧾</span>ประวัติ</button>
+  <button data-view="planning"><span class="icon">🧮</span>วางแผน</button>
+  <button data-view="summary"><span class="icon">📊</span>สรุป</button>
+  <button data-view="settings"><span class="icon">⚙️</span>ตั้งค่า</button>
+</nav>
+
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
