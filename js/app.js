@@ -2,6 +2,9 @@ import * as db from './db.js';
 import * as calc from './calc.js';
 import * as charts from './charts.js';
 import * as drive from './drive.js';
+import { supabase } from './supabaseClient.js';
+
+const slipFileCache = new Map(); // slipId -> File, for slips added this session (avoids re-download for preview/Drive upload)
 
 const $view = document.getElementById('app-view');
 const $nav = document.getElementById('bottom-nav');
@@ -228,11 +231,25 @@ function driveStatusBadge(status) {
   return '';
 }
 
-function slipThumbHTML(inst) {
-  const items = (inst.slips || []).map((s, idx) => {
-    const url = trackURL(URL.createObjectURL(s.blob));
+async function getSlipImageURL(slip) {
+  if (slipFileCache.has(slip.id)) {
+    return trackURL(URL.createObjectURL(slipFileCache.get(slip.id)));
+  }
+  try {
+    const url = await db.getSlipSignedUrl(slip.storagePath);
+    return url;
+  } catch (err) {
+    console.warn('Could not get signed URL for slip', slip.storagePath, err);
+    return '';
+  }
+}
+
+async function slipThumbHTML(inst) {
+  const slips = inst.slips || [];
+  const urls = await Promise.all(slips.map(getSlipImageURL));
+  const items = slips.map((s, idx) => {
     return `<div class="slip-thumb" data-action="view-slip" data-n="${inst.installmentNumber}" data-idx="${idx}">
-      <img src="${url}" alt="สลิปงวด ${inst.installmentNumber}">
+      <img src="${urls[idx]}" alt="สลิปงวด ${inst.installmentNumber}">
       ${driveStatusBadge(s.driveStatus)}
       <button class="slip-remove" data-action="remove-slip" data-n="${inst.installmentNumber}" data-idx="${idx}" title="ลบสลิป">✕</button>
     </div>`;
@@ -246,11 +263,12 @@ function slipThumbHTML(inst) {
   </div>`;
 }
 
-function renderInstallmentModal(n) {
+async function renderInstallmentModal(n) {
   const inst = state.installments.find((i) => i.installmentNumber === n);
   if (!inst) return;
   const status = calc.computeStatus(inst);
   const diff = calc.computeDiff(inst);
+  const slipGridHTML = await slipThumbHTML(inst);
 
   const html = `
     <div class="modal-header">
@@ -298,7 +316,7 @@ function renderInstallmentModal(n) {
 
       <div class="field">
         <label>สลิปการโอน</label>
-        ${slipThumbHTML(inst)}
+        ${slipGridHTML}
       </div>
 
       <button type="submit" class="btn btn-success">บันทึกการชำระเงิน</button>
@@ -376,19 +394,30 @@ async function handleSlipFiles(n, fileList) {
   if (files.length === 0) return;
   const inst = state.installments.find((i) => i.installmentNumber === n);
   inst.slips = inst.slips || [];
+  const uid = await db.getCurrentUserId();
   const newSlips = [];
   for (const file of files) {
     if (!ALLOWED_SLIP_TYPES.includes(file.type)) {
       showToast('รองรับเฉพาะไฟล์ JPG, PNG, WEBP เท่านั้น');
       continue;
     }
-    const slip = { id: uuid(), mimeType: file.type, fileName: file.name, uploadedAt: new Date().toISOString(), blob: file, driveStatus: null };
+    const slipId = uuid();
+    const ext = file.type.split('/')[1] || 'jpg';
+    const storagePath = db.slipStoragePath(uid, n, slipId, ext);
+    try {
+      await db.uploadSlipFile(storagePath, file);
+    } catch (err) {
+      showToast('อัปโหลดสลิปไม่สำเร็จ: ' + err.message);
+      continue;
+    }
+    slipFileCache.set(slipId, file);
+    const slip = { id: slipId, storagePath, mimeType: file.type, fileName: file.name, uploadedAt: new Date().toISOString(), driveStatus: null };
     inst.slips.push(slip);
     newSlips.push(slip);
   }
   await db.saveInstallment(inst);
   await reloadFromDB();
-  refreshSlipGrid(n);
+  await refreshSlipGrid(n);
   showToast('เพิ่มสลิปเรียบร้อย');
 
   const s = state.settings;
@@ -397,12 +426,18 @@ async function handleSlipFiles(n, fileList) {
   }
 }
 
-function refreshSlipGrid(n) {
+async function refreshSlipGrid(n) {
   const inst = state.installments.find((i) => i.installmentNumber === n);
   const grid = document.getElementById('slip-grid');
   if (!grid) return;
-  grid.outerHTML = slipThumbHTML(inst);
+  grid.outerHTML = await slipThumbHTML(inst);
   document.getElementById('slip-file-input').addEventListener('change', (e) => handleSlipFiles(n, e.target.files));
+}
+
+async function getSlipFileForUpload(slip) {
+  if (slipFileCache.has(slip.id)) return slipFileCache.get(slip.id);
+  const blob = await db.downloadSlipFile(slip.storagePath);
+  return new File([blob], slip.fileName || 'slip.jpg', { type: slip.mimeType });
 }
 
 async function uploadSlipToDrive(n, slipId) {
@@ -414,19 +449,20 @@ async function uploadSlipToDrive(n, slipId) {
   if (!drive.isConnected()) {
     slip.driveStatus = 'pending';
     await db.saveInstallment(inst);
-    refreshSlipGrid(n);
+    await refreshSlipGrid(n);
     return;
   }
 
   slip.driveStatus = 'uploading';
-  refreshSlipGrid(n);
+  await refreshSlipGrid(n);
   try {
+    const file = await getSlipFileForUpload(slip);
     const ext = slip.mimeType.split('/')[1] || 'jpg';
     const fileName = `cx3-slip-installment${n}-${slip.uploadedAt.replace(/[:.]/g, '-')}.${ext}`;
     const result = await drive.uploadFileToFolder({
       clientId: s.driveClientId,
       folderId: s.driveFolderId,
-      file: slip.blob,
+      file,
       fileName,
     });
     slip.driveStatus = 'uploaded';
@@ -440,7 +476,7 @@ async function uploadSlipToDrive(n, slipId) {
   }
   await db.saveInstallment(inst);
   await reloadFromDB();
-  refreshSlipGrid(n);
+  await refreshSlipGrid(n);
 }
 
 async function syncPendingSlipsToDrive() {
@@ -468,18 +504,22 @@ async function syncPendingSlipsToDrive() {
 async function removeSlip(n, idx) {
   const inst = state.installments.find((i) => i.installmentNumber === n);
   if (!inst || !inst.slips) return;
-  inst.slips.splice(idx, 1);
+  const [removed] = inst.slips.splice(idx, 1);
   await db.saveInstallment(inst);
   await reloadFromDB();
-  refreshSlipGrid(n);
+  await refreshSlipGrid(n);
   showToast('ลบสลิปแล้ว');
+  if (removed && removed.storagePath) {
+    db.deleteSlipFile(removed.storagePath).catch((err) => console.warn('Could not delete slip file', err));
+    slipFileCache.delete(removed.id);
+  }
 }
 
-function viewSlip(n, idx) {
+async function viewSlip(n, idx) {
   const inst = state.installments.find((i) => i.installmentNumber === n);
   const slip = inst.slips[idx];
   if (!slip) return;
-  const url = trackURL(URL.createObjectURL(slip.blob));
+  const url = await getSlipImageURL(slip);
   const box = document.createElement('div');
   box.className = 'lightbox';
   const driveLink = slip.driveWebViewLink
@@ -762,6 +802,10 @@ function renderSettings() {
       <p class="text-muted">การกระทำนี้ไม่สามารถย้อนกลับได้ ระบบจะให้ยืนยัน 2 ขั้นตอน</p>
       <button class="btn btn-danger mt-12" id="btn-reset">รีเซ็ตข้อมูลทั้งหมด</button>
     </div>
+
+    <div class="card mt-16">
+      <button class="btn btn-outline" id="btn-sign-out">ออกจากระบบ</button>
+    </div>
   `;
 
   document.getElementById('settings-form').addEventListener('submit', onSaveSettings);
@@ -778,6 +822,7 @@ function renderSettings() {
   document.getElementById('drive-settings-form').addEventListener('submit', onSaveDriveSettings);
   document.getElementById('btn-drive-connect').addEventListener('click', onDriveConnect);
   document.getElementById('btn-drive-sync').addEventListener('click', syncPendingSlipsToDrive);
+  document.getElementById('btn-sign-out').addEventListener('click', signOut);
   updateDriveStatusUI();
 }
 
@@ -1008,17 +1053,77 @@ $nav.addEventListener('click', (e) => {
   if (btn) navigateTo(btn.dataset.view);
 });
 
+// ---------- Auth ----------
+
+function renderLogin(errorMsg) {
+  $nav.style.display = 'none';
+  $view.innerHTML = `
+    <div class="card" style="margin-top:60px">
+      <h2 style="margin-bottom:4px">เข้าสู่ระบบ CX-3</h2>
+      <p class="text-muted mt-8">ข้อมูลของคุณซิงก์ผ่าน Supabase ต้องล็อกอินก่อนใช้งาน</p>
+      <form id="login-form" class="mt-16">
+        <div class="field">
+          <label>อีเมล</label>
+          <input type="email" name="email" required autocomplete="username">
+        </div>
+        <div class="field">
+          <label>รหัสผ่าน</label>
+          <input type="password" name="password" required autocomplete="current-password">
+        </div>
+        ${errorMsg ? `<p style="color:var(--color-red)" class="mt-8">${errorMsg}</p>` : ''}
+        <button type="submit" class="btn btn-primary mt-12">เข้าสู่ระบบ</button>
+      </form>
+    </div>
+  `;
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    const { error } = await supabase.auth.signInWithPassword({
+      email: fd.get('email'),
+      password: fd.get('password'),
+    });
+    if (error) {
+      renderLogin('เข้าสู่ระบบไม่สำเร็จ: ' + error.message);
+      return;
+    }
+    await startApp();
+  });
+}
+
+async function signOut() {
+  await supabase.auth.signOut();
+  window.location.reload();
+}
+
+async function startApp() {
+  $nav.style.display = '';
+  try {
+    await ensureInitialized();
+  } catch (err) {
+    if (err.message === 'NOT_AUTHENTICATED') { renderLogin(); return; }
+    $view.innerHTML = `<div class="card"><p style="color:var(--color-red)">โหลดข้อมูลไม่สำเร็จ: ${err.message}</p><p class="text-muted mt-8">ตรวจสอบการเชื่อมต่ออินเทอร์เน็ตแล้วลองรีเฟรชหน้าอีกครั้ง</p></div>`;
+    return;
+  }
+  navigateTo('dashboard');
+  checkDueReminder();
+}
+
 // ---------- Init ----------
 
 async function init() {
-  await ensureInitialized();
-  navigateTo('dashboard');
-  checkDueReminder();
-
   if ('serviceWorker' in navigator) {
     try { await navigator.serviceWorker.register('service-worker.js'); }
     catch (err) { console.warn('SW registration failed', err); }
   }
+
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) {
+    renderLogin();
+    return;
+  }
+  await startApp();
 }
 
 init();

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'cx3-cache-v2';
+const CACHE_NAME = 'cx3-cache-v3';
 const APP_SHELL = [
   './',
   './index.html',
@@ -9,6 +9,7 @@ const APP_SHELL = [
   './js/calc.js',
   './js/charts.js',
   './js/drive.js',
+  './js/supabaseClient.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/apple-touch-icon.png',

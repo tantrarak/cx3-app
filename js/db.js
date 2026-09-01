@@ -1,107 +1,197 @@
-// db.js — IndexedDB wrapper. Structure is deliberately flat/plain-object so it can be
-// swapped for Firebase/Supabase later: settings = single document, installments = collection
-// keyed by installmentNumber, each installment optionally embeds slip images.
+// db.js — Supabase-backed persistence. Replaces the earlier IndexedDB version so data
+// syncs across devices. Function names/shapes are kept close to the old IndexedDB API
+// so the rest of the app didn't need to change much.
+//
+// Slip binaries live in Supabase Storage (bucket "slips", path `${userId}/${installmentNumber}/${slipId}.${ext}`).
+// Each installment row keeps only slip *metadata* (id, storagePath, mimeType, fileName, uploadedAt, drive* fields)
+// in a jsonb column — the actual image bytes are fetched on demand via signed URL or download().
 
-const DB_NAME = 'cx3-db';
-const DB_VERSION = 1;
-const STORE_SETTINGS = 'settings';
-const STORE_INSTALLMENTS = 'installments';
-const SETTINGS_ID = 'main';
+import { supabase } from './supabaseClient.js';
 
-let dbPromise = null;
+const SLIP_BUCKET = 'slips';
 
-function openDB() {
-  if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(STORE_SETTINGS)) {
-        db.createObjectStore(STORE_SETTINGS, { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains(STORE_INSTALLMENTS)) {
-        db.createObjectStore(STORE_INSTALLMENTS, { keyPath: 'installmentNumber' });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-  return dbPromise;
+export async function getCurrentUserId() {
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data.user) throw new Error('NOT_AUTHENTICATED');
+  return data.user.id;
 }
 
-function tx(storeName, mode) {
-  return openDB().then((db) => db.transaction(storeName, mode).objectStore(storeName));
+function mapSettingsFromRow(row) {
+  return {
+    monthlyAmount: Number(row.monthly_amount),
+    totalInstallments: row.total_installments,
+    firstDueDate: row.first_due_date,
+    dueDay: row.due_day,
+    principalFromFinance: row.principal_from_finance != null ? Number(row.principal_from_finance) : null,
+    overpaymentPolicyDefault: row.overpayment_policy_default || 'accumulate',
+    notifyEnabled: !!row.notify_enabled,
+    notifyDaysBefore: row.notify_days_before ?? 3,
+    driveEnabled: !!row.drive_enabled,
+    driveClientId: row.drive_client_id || '',
+    driveFolderId: row.drive_folder_id || '',
+  };
 }
 
-function reqToPromise(req) {
-  return new Promise((resolve, reject) => {
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
+function mapSettingsToRow(s, userId) {
+  return {
+    user_id: userId,
+    monthly_amount: s.monthlyAmount,
+    total_installments: s.totalInstallments,
+    first_due_date: s.firstDueDate,
+    due_day: s.dueDay,
+    principal_from_finance: s.principalFromFinance,
+    overpayment_policy_default: s.overpaymentPolicyDefault,
+    notify_enabled: s.notifyEnabled,
+    notify_days_before: s.notifyDaysBefore,
+    drive_enabled: s.driveEnabled,
+    drive_client_id: s.driveClientId,
+    drive_folder_id: s.driveFolderId,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function mapInstallmentFromRow(row) {
+  return {
+    installmentNumber: row.installment_number,
+    dueDate: row.due_date,
+    scheduledAmount: Number(row.scheduled_amount),
+    paidAmount: row.paid_amount != null ? Number(row.paid_amount) : null,
+    paidDate: row.paid_date,
+    paidTime: row.paid_time,
+    overpaymentAllocation: row.overpayment_allocation,
+    remainingPrincipal: row.remaining_principal != null ? Number(row.remaining_principal) : null,
+    remainingInterest: row.remaining_interest != null ? Number(row.remaining_interest) : null,
+    note: row.note || '',
+    slips: row.slips || [],
+  };
+}
+
+function mapInstallmentToRow(inst, userId) {
+  return {
+    user_id: userId,
+    installment_number: inst.installmentNumber,
+    due_date: inst.dueDate,
+    scheduled_amount: inst.scheduledAmount,
+    paid_amount: inst.paidAmount,
+    paid_date: inst.paidDate,
+    paid_time: inst.paidTime,
+    overpayment_allocation: inst.overpaymentAllocation,
+    remaining_principal: inst.remainingPrincipal,
+    remaining_interest: inst.remainingInterest,
+    note: inst.note || '',
+    slips: inst.slips || [],
+    updated_at: new Date().toISOString(),
+  };
 }
 
 export async function getSettings() {
-  const store = await tx(STORE_SETTINGS, 'readonly');
-  const result = await reqToPromise(store.get(SETTINGS_ID));
-  return result || null;
+  const uid = await getCurrentUserId();
+  const { data, error } = await supabase.from('settings').select('*').eq('user_id', uid).maybeSingle();
+  if (error) throw error;
+  return data ? mapSettingsFromRow(data) : null;
 }
 
 export async function saveSettings(settings) {
-  const store = await tx(STORE_SETTINGS, 'readwrite');
-  await reqToPromise(store.put({ ...settings, id: SETTINGS_ID }));
+  const uid = await getCurrentUserId();
+  const { error } = await supabase.from('settings').upsert(mapSettingsToRow(settings, uid));
+  if (error) throw error;
 }
 
 export async function getAllInstallments() {
-  const store = await tx(STORE_INSTALLMENTS, 'readonly');
-  const result = await reqToPromise(store.getAll());
-  return (result || []).sort((a, b) => a.installmentNumber - b.installmentNumber);
+  const uid = await getCurrentUserId();
+  const { data, error } = await supabase
+    .from('installments')
+    .select('*')
+    .eq('user_id', uid)
+    .order('installment_number');
+  if (error) throw error;
+  return (data || []).map(mapInstallmentFromRow);
 }
 
 export async function getInstallment(n) {
-  const store = await tx(STORE_INSTALLMENTS, 'readonly');
-  return reqToPromise(store.get(n));
+  const uid = await getCurrentUserId();
+  const { data, error } = await supabase
+    .from('installments')
+    .select('*')
+    .eq('user_id', uid)
+    .eq('installment_number', n)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? mapInstallmentFromRow(data) : null;
 }
 
 export async function saveInstallment(installment) {
-  const store = await tx(STORE_INSTALLMENTS, 'readwrite');
-  await reqToPromise(store.put(installment));
+  const uid = await getCurrentUserId();
+  const { error } = await supabase
+    .from('installments')
+    .upsert(mapInstallmentToRow(installment, uid), { onConflict: 'user_id,installment_number' });
+  if (error) throw error;
 }
 
 export async function bulkPutInstallments(installments) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const t = db.transaction(STORE_INSTALLMENTS, 'readwrite');
-    const store = t.objectStore(STORE_INSTALLMENTS);
-    for (const inst of installments) store.put(inst);
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-  });
+  const uid = await getCurrentUserId();
+  const rows = installments.map((i) => mapInstallmentToRow(i, uid));
+  const { error } = await supabase
+    .from('installments')
+    .upsert(rows, { onConflict: 'user_id,installment_number' });
+  if (error) throw error;
 }
 
 export async function deleteInstallmentsAbove(n) {
-  const all = await getAllInstallments();
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const t = db.transaction(STORE_INSTALLMENTS, 'readwrite');
-    const store = t.objectStore(STORE_INSTALLMENTS);
-    for (const inst of all) {
-      if (inst.installmentNumber > n) store.delete(inst.installmentNumber);
-    }
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-  });
+  const uid = await getCurrentUserId();
+  const { error } = await supabase
+    .from('installments')
+    .delete()
+    .eq('user_id', uid)
+    .gt('installment_number', n);
+  if (error) throw error;
 }
 
 export async function clearAll() {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const t = db.transaction([STORE_SETTINGS, STORE_INSTALLMENTS], 'readwrite');
-    t.objectStore(STORE_SETTINGS).clear();
-    t.objectStore(STORE_INSTALLMENTS).clear();
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-  });
+  const uid = await getCurrentUserId();
+  try {
+    const installments = await getAllInstallments();
+    const paths = installments.flatMap((inst) => (inst.slips || []).map((s) => s.storagePath).filter(Boolean));
+    if (paths.length) await supabase.storage.from(SLIP_BUCKET).remove(paths);
+  } catch (err) {
+    console.warn('Could not clean up slip files before reset', err);
+  }
+  await supabase.from('installments').delete().eq('user_id', uid);
+  await supabase.from('settings').delete().eq('user_id', uid);
 }
+
+// ---------- Slip file storage ----------
+
+export function slipStoragePath(userId, installmentNumber, slipId, ext) {
+  return `${userId}/${installmentNumber}/${slipId}.${ext}`;
+}
+
+export async function uploadSlipFile(storagePath, file) {
+  const { error } = await supabase.storage.from(SLIP_BUCKET).upload(storagePath, file, {
+    contentType: file.type,
+    upsert: false,
+  });
+  if (error) throw error;
+}
+
+export async function getSlipSignedUrl(storagePath, expiresInSeconds = 3600) {
+  const { data, error } = await supabase.storage.from(SLIP_BUCKET).createSignedUrl(storagePath, expiresInSeconds);
+  if (error) throw error;
+  return data.signedUrl;
+}
+
+export async function downloadSlipFile(storagePath) {
+  const { data, error } = await supabase.storage.from(SLIP_BUCKET).download(storagePath);
+  if (error) throw error;
+  return data; // Blob
+}
+
+export async function deleteSlipFile(storagePath) {
+  const { error } = await supabase.storage.from(SLIP_BUCKET).remove([storagePath]);
+  if (error) throw error;
+}
+
+// ---------- Backup / restore (JSON, slip images embedded as data URLs) ----------
 
 function blobToDataURL(blob) {
   return new Promise((resolve, reject) => {
@@ -124,43 +214,62 @@ export async function exportAllData() {
   for (const inst of installments) {
     const slips = [];
     for (const slip of inst.slips || []) {
-      slips.push({
-        id: slip.id,
-        mimeType: slip.mimeType,
-        fileName: slip.fileName,
-        uploadedAt: slip.uploadedAt,
-        dataURL: slip.blob ? await blobToDataURL(slip.blob) : null,
-      });
+      let dataURL = null;
+      try {
+        const blob = await downloadSlipFile(slip.storagePath);
+        dataURL = await blobToDataURL(blob);
+      } catch (err) {
+        console.warn('Could not download slip for export', slip.storagePath, err);
+      }
+      slips.push({ id: slip.id, mimeType: slip.mimeType, fileName: slip.fileName, uploadedAt: slip.uploadedAt, dataURL });
     }
     installmentsForExport.push({ ...inst, slips });
   }
   return {
     exportedAt: new Date().toISOString(),
-    appVersion: 1,
+    appVersion: 2,
     settings,
     installments: installmentsForExport,
   };
 }
 
-export async function importAllData(data) {
+// Imports a backup JSON (from either the old IndexedDB export or Supabase export format)
+// into Supabase for the currently signed-in user. Re-uploads embedded slip images to Storage.
+export async function importAllData(data, { onProgress } = {}) {
   if (!data || !data.settings || !Array.isArray(data.installments)) {
     throw new Error('รูปแบบไฟล์ไม่ถูกต้อง');
   }
-  await clearAll();
+  const uid = await getCurrentUserId();
   await saveSettings(data.settings);
+
   const installments = [];
+  let done = 0;
   for (const inst of data.installments) {
     const slips = [];
     for (const slip of inst.slips || []) {
-      slips.push({
-        id: slip.id,
-        mimeType: slip.mimeType,
-        fileName: slip.fileName,
-        uploadedAt: slip.uploadedAt,
-        blob: slip.dataURL ? await dataURLToBlob(slip.dataURL) : null,
-      });
+      if (!slip.dataURL) continue;
+      try {
+        const blob = await dataURLToBlob(slip.dataURL);
+        const ext = (slip.mimeType || 'image/jpeg').split('/')[1] || 'jpg';
+        const storagePath = slipStoragePath(uid, inst.installmentNumber, slip.id, ext);
+        await uploadSlipFile(storagePath, blob);
+        slips.push({
+          id: slip.id,
+          storagePath,
+          mimeType: slip.mimeType,
+          fileName: slip.fileName,
+          uploadedAt: slip.uploadedAt,
+          driveStatus: slip.driveStatus || null,
+          driveFileId: slip.driveFileId,
+          driveWebViewLink: slip.driveWebViewLink,
+        });
+      } catch (err) {
+        console.warn('Could not import slip', slip.id, err);
+      }
     }
     installments.push({ ...inst, slips });
+    done++;
+    if (onProgress) onProgress(done, data.installments.length);
   }
   await bulkPutInstallments(installments);
 }
